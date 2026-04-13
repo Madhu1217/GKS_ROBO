@@ -1,0 +1,138 @@
+pipeline {
+  agent any
+    options {
+            skipDefaultCheckout()   // ✅ correct location
+        }
+  environment {
+    AWS_REGION      = 'us-east-1'
+    // AWS_ACCOUNT_ID  = credentials('aws-ecr-creds-id')
+    // ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_TAG       = "${BUILD_NUMBER}"
+    GITHUB_REPO    = credentials('github-repo-url')
+    SONARQUBE_URL  = credentials('SONARQUBE_URL')
+      }
+ 
+  stages {
+ 
+    stage('Checkout') {
+      steps { git branch: 'main', url: "${GITHUB_REPO}" }
+      
+    }
+ 
+    stage('SonarQube Analysis') {
+      steps {
+        withSonarQubeEnv('sonarqube') {
+            // withEnv(["PATH+SONAR=${tool 'sonar-scanner'}/bin"]) {
+                sh '''
+                /opt/sonar-scanner/bin/sonar-scanner \
+                -Dsonar.projectKey=robot-shop \
+                -Dsonar.sources=.\
+                -Dsonar.exclusions=**/*.java
+            '''
+            
+            
+            }
+      }
+    }
+ 
+    stage('Quality Gate') {
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+ 
+    // stage('Docker Build & Push to ECR') {
+    //   steps {
+    //     withAWS(credentials: 'aws-ecr-creds', region: env.AWS_REGION) {
+    //       sh '''
+    //         aws ecr get-login-password --region $AWS_REGION | \
+    //           docker login --username AWS --password-stdin $ECR_REGISTRY
+ 
+    //         for SERVICE in web cart catalogue user payment shipping ratings dispatch; do
+    //           docker build -t $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG ./$SERVICE
+    //           docker push  $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG
+    //         done
+    //       '''
+    //     }
+    //   }
+    // }
+    stage('Docker Build & Push to ECR') {
+        steps {
+            withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: 'aws-ecr-creds',
+            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]]) {
+            sh '''
+                # Resolve account ID dynamically using injected credentials
+                AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                echo "Logging into ECR: $ECR_REGISTRY"
+
+                aws ecr get-login-password --region $AWS_REGION | \
+                docker login --username AWS --password-stdin $ECR_REGISTRY
+
+                for SERVICE in web cart catalogue user payment shipping ratings dispatch; do
+                docker build -t $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG ./$SERVICE
+                docker push  $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG
+                done
+            '''
+            }
+        }
+        }
+    // stage('Update Helm values & push') {
+    //   steps {
+    //     sh '''
+    //       sed -i "s|version: .*|version: $IMAGE_TAG|" K8s/helm/values.yaml
+    //       sed -i "s|repo: .*|repo: $ECR_REGISTRY/robot-shop|" K8s/helm/values.yaml
+    //       git config user.email 'jenkins@ci'
+    //       git config user.name  'Jenkins'
+    //       git add K8s/helm/values.yaml
+    //       git commit -m "ci: update image tag to $IMAGE_TAG"
+    //       git push
+    //     '''
+    //   }
+    // }
+    stage('Update Helm values & push') {
+        steps {
+            withCredentials([
+            [
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'aws-ecr-creds',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ],
+            usernamePassword(
+                credentialsId: 'github-creds',
+                usernameVariable: 'GIT_USER',
+                passwordVariable: 'GIT_TOKEN'
+            )
+            ]) {
+            sh '''
+                AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+                sed -i "s|version: .*|version: $IMAGE_TAG|" K8s/helm/values.yaml
+                sed -i "s|repo: .*|repo: $ECR_REGISTRY/robot-shop|" K8s/helm/values.yaml
+
+                git config user.email 'jenkins@ci'
+                git config user.name  'Jenkins'
+                git add K8s/helm/values.yaml
+                git commit -m "ci: update image tag to $IMAGE_TAG" || echo "Nothing to commit"
+
+                git push https://${GIT_USER}:${GIT_TOKEN}@github.com/Madhu1217/robo-shop-master.git HEAD:main
+            '''
+            }
+        }
+    }  
+  }
+ 
+  post {
+    failure { echo 'Pipeline failed — check logs above' }
+    success { echo 'Build complete — ArgoCD will sync automatically' }
+  }
+}
