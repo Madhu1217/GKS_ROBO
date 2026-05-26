@@ -4,9 +4,9 @@ pipeline {
             skipDefaultCheckout()   // ✅ correct location
         }
   environment {
-    AWS_REGION      = 'us-east-1'
-    // AWS_ACCOUNT_ID  = credentials('aws-ecr-creds-id')
-    // ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    GCP_REGION      = 'asia-south1'
+    GCP_PROJECT_ID  = 'robot-shop-gke-madhu'
+    GCP_REGISTRY    = "${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT_ID}/robot-shop"
     IMAGE_TAG       = "${BUILD_NUMBER}"
     GITHUB_REPO    = credentials('github-repo-url')
     SONARQUBE_URL  = credentials('SONARQUBE_URL')
@@ -58,27 +58,17 @@ pipeline {
     //     }
     //   }
     // }
-    stage('Docker Build & Push to ECR') {
+    stage('Docker Build & Push to GCP') {
         steps {
-            withCredentials([[
-            $class: 'AmazonWebServicesCredentialsBinding',
-            credentialsId: 'aws-ecr-creds',
-            accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-            secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-            ]]) {
+            withCredentials([usernamePassword(credentialsId: 'gcp-artifact-registry-creds', passwordVariable: 'GCP_SA_KEY', usernameVariable: 'GCP_SA_USERNAME')]) {
             sh '''
-                # Resolve account ID dynamically using injected credentials
-                AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-                ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+                echo "Logging into GCP Artifact Registry: $GCP_REGISTRY"
 
-                echo "Logging into ECR: $ECR_REGISTRY"
-
-                aws ecr get-login-password --region $AWS_REGION | \
-                docker login --username AWS --password-stdin $ECR_REGISTRY
+                echo $GCP_SA_KEY | docker login -u $GCP_SA_USERNAME --password-stdin https://${GCP_REGION}-docker.pkg.dev
 
                 for SERVICE in web cart catalogue user payment shipping ratings dispatch; do
-                docker build -t $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG ./$SERVICE
-                docker push  $ECR_REGISTRY/robot-shop/$SERVICE:$IMAGE_TAG
+                docker build -t $GCP_REGISTRY/$SERVICE:$IMAGE_TAG ./$SERVICE
+                docker push  $GCP_REGISTRY/$SERVICE:$IMAGE_TAG
                 done
             '''
             }
@@ -100,12 +90,6 @@ pipeline {
     stage('Update Helm values & push') {
         steps {
             withCredentials([
-            [
-                $class: 'AmazonWebServicesCredentialsBinding',
-                credentialsId: 'aws-ecr-creds',
-                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
-                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
-            ],
             usernamePassword(
                 credentialsId: 'github-creds',
                 usernameVariable: 'GIT_USER',
@@ -113,11 +97,8 @@ pipeline {
             )
             ]) {
             sh '''
-                AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-                ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-                sed -i "s|version: .*|version: $IMAGE_TAG|" K8s/helm/values.yaml
-                sed -i "s|repo: .*|repo: $ECR_REGISTRY/robot-shop|" K8s/helm/values.yaml
+                sed -i "s|tag: .*|tag: $IMAGE_TAG|" K8s/helm/values.yaml
+                sed -i "s|repo: .*|repo: $GCP_REGISTRY|" K8s/helm/values.yaml
 
                 git config user.email 'jenkins@ci'
                 git config user.name  'Jenkins'
